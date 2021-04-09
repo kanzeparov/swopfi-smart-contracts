@@ -148,6 +148,134 @@ func init() = {
 func replenishWithTwoTokens(slippageTolerance: Int) = {
     let pmtAssetIdA = i.payments[0].assetId
     let pmtAssetIdB = i.payments[1].assetId
+    let pmtAmountA = deductStakingFee(i.payments[0].amount, pmtAssetIdA)
+    let pmtAmountB = deductStakingFee(i.payments[1].amount, pmtAssetIdB)
+    let ratioShareTokensInA = fraction(pmtAmountA, scaleValue8, balanceA)
+    let ratioShareTokensInB = fraction(pmtAmountB, scaleValue8, balanceB)
+
+    func calculateFees(tokenFrom: Int, tokenTo: Int, pmtAmount: Int) = {
+        let amountWithoutFee = fraction(tokenTo, pmtAmount, pmtAmount + tokenFrom)
+        let amountWithFee = fraction(amountWithoutFee, commissionScaleDelimiter - commission, commissionScaleDelimiter)
+        let governanceReward = fraction(amountWithoutFee, commissionGovernance, commissionScaleDelimiter)
+        (amountWithoutFee, amountWithFee, governanceReward)
+    }
+
+    func exchangeTokenWithoutFee (balanceA: Int, balanceB: Int, paymentAmountA: Int, paymentAmountB: Int) = {
+        let bEquation = ((fraction(balanceA, scaleValue8, 1)
+            + fraction(paymentAmountA, scaleValue8, 2))
+            - fraction(fraction(scaleValue8, balanceA, 2), paymentAmountB, balanceB))
+        let DEquation = ((((pow(paymentAmountA, 0, 2, 0, scaleValue8Digits, UP) / 4)
+            + ((balanceA * balanceA) * scaleValue8))
+            - fraction(fraction(paymentAmountA, (scaleValue8 * paymentAmountB), 2), balanceA, balanceB))
+            + (pow(fraction(paymentAmountB, (balanceA * scaleValue8), (2 * balanceB)), 0, 2, 0, 0, DOWN) / scaleValue8))
+        let a = (-(bEquation) + pow(DEquation, 0, 5, 1, (scaleValue8Digits / 2), DOWN))
+        let denominatorb = (a + (balanceA * scaleValue8))
+        let b = fraction(a, (balanceB * scaleValue8), denominatorb)
+        if ((a < scaleValue8 && a > -scaleValue8) || (b > -scaleValue8 && b < scaleValue8)) then {
+            (0,0)
+        }
+        else if ratioShareTokensInA < ratioShareTokensInB then {
+            (a,b)
+        } else if ratioShareTokensInB < ratioShareTokensInA then {
+            (-b,-a)
+        } else
+            (0,0)
+    }
+
+    let (buyToken, sellToken) = exchangeTokenWithoutFee(balanceA, balanceB, pmtAmountA, pmtAmountB)
+
+    if !isActive then
+        throw("DApp is inactive at this moment")
+    else if slippageTolerance < 0 || slippageTolerance > slippageToleranceDelimiter then
+        throw("Slippage tolerance must be between 0 and " + slippageToleranceDelimiter.toString() + " inclusively. Actual: " + slippageTolerance.toString())
+    else if i.payments.size() != 2 then
+        throw("Two attached assets expected")
+    else if pmtAssetIdA != assetIdA || pmtAssetIdB != assetIdB then
+        throw("Incorrect assets attached. Expected: " + strAssetIdA + " and " + strAssetIdB)
+    else if !hasEnoughBalance then
+        suspend("Suspicious state. Actual balances: " + balanceA.toString() + " " + assetNameA + ", " + balanceB.toString() + " " + assetNameB
+        + ". State: " + accountBalance(assetIdA).toString() + " " + assetNameA + ", " + accountBalance(assetIdB).toString() + " " + assetNameB)
+    else if(buyToken/scaleValue8 == 0) || (sellToken/scaleValue8 == 0) then {
+        let ratioShareTokensInANew = fraction(pmtAmountA, scaleValue8, balanceA)
+        let ratioShareTokensInBNew = fraction(pmtAmountB, scaleValue8, balanceB)
+        let shareTokenToPayAmount = min([ratioShareTokensInANew, ratioShareTokensInBNew]).fraction(shareAssetSupply, scaleValue8)
+
+        if shareTokenToPayAmount == 0 then
+            throw("Too small amount to replenish")
+        else
+            [
+                IntegerEntry(keyBalanceA, balanceA + pmtAmountA),
+                IntegerEntry(keyBalanceB, balanceB + pmtAmountB),
+                IntegerEntry(keyShareAssetSupply, shareAssetSupply + shareTokenToPayAmount),
+                Reissue(shareAssetId, shareTokenToPayAmount, true),
+                ScriptTransfer(i.caller, shareTokenToPayAmount, shareAssetId)
+            ]
+    }
+    else if ratioShareTokensInA > ratioShareTokensInB then {
+        let assetIdSend = pmtAssetIdB
+        let (amountWithoutFee, amountWithFee, governanceReward) = calculateFees(balanceB, balanceA, buyToken/scaleValue8)
+        let newPmtAmountA = pmtAmountA - amountWithoutFee
+        let newPmtAmountB = pmtAmountB + buyToken/scaleValue8
+        let newBalanceA = balanceA + newPmtAmountA + amountWithoutFee
+        let newBalanceB = balanceB + newPmtAmountB - buyToken/scaleValue8
+        let tokenRatio = fraction(newBalanceA, scaleValue8, newPmtAmountA)
+                    .fraction(scaleValue3, newBalanceB.fraction(scaleValue8, newPmtAmountB))
+        let ratioShareTokensInANew = fraction(newPmtAmountA, scaleValue8, newBalanceA)
+        let ratioShareTokensInBNew = fraction(newPmtAmountB, scaleValue8, newBalanceB)
+        let shareTokenToPayAmount = min([ratioShareTokensInANew, ratioShareTokensInBNew]).fraction(shareAssetSupply, scaleValue8)
+
+        if tokenRatio < (scaleValue3 * (slippageToleranceDelimiter - slippageTolerance)) / slippageToleranceDelimiter
+            || tokenRatio > (scaleValue3 * (slippageToleranceDelimiter + slippageTolerance)) / slippageToleranceDelimiter then
+            throw("Incorrect assets amount: amounts must have the contract ratio")
+        else if shareTokenToPayAmount == 0 then
+            throw("Too small amount to replenish")
+        else if (assetIdA == USDN && newBalanceA <= stakedAmountUSDN) || (assetIdB == USDN && newBalanceB <= stakedAmountUSDN) then
+            throwInsufficientAvailableBalance(amountWithFee, availableBalanceB, assetNameB)
+        else
+            [
+                IntegerEntry(keyBalanceA, newBalanceA),
+                IntegerEntry(keyBalanceB, newBalanceB),
+                IntegerEntry(keyShareAssetSupply, shareAssetSupply + shareTokenToPayAmount),
+                Reissue(shareAssetId, shareTokenToPayAmount, true),
+                ScriptTransfer(i.caller, shareTokenToPayAmount, shareAssetId)
+            ]
+    } else if ratioShareTokensInA < ratioShareTokensInB then {
+        let assetIdSend = pmtAssetIdA
+        let (amountWithoutFee, amountWithFee, governanceReward) = calculateFees(balanceA, balanceB, buyToken/scaleValue8)
+        let newPmtAmountA = pmtAmountA + buyToken/scaleValue8
+        let newPmtAmountB = pmtAmountB - amountWithoutFee
+        let newBalanceA = balanceA + newPmtAmountA - buyToken/scaleValue8
+        let newBalanceB = balanceB + newPmtAmountB + amountWithoutFee
+        let tokenRatio = fraction(newBalanceA, scaleValue8, newPmtAmountA)
+                    .fraction(scaleValue3, newBalanceB.fraction(scaleValue8, newPmtAmountB))
+        let ratioShareTokensInANew = fraction(newPmtAmountA, scaleValue8, newBalanceA)
+        let ratioShareTokensInBNew = fraction(newPmtAmountB, scaleValue8, newBalanceB)
+        let shareTokenToPayAmount = min([ratioShareTokensInANew, ratioShareTokensInBNew]).fraction(shareAssetSupply, scaleValue8)
+
+        if tokenRatio < (scaleValue3 * (slippageToleranceDelimiter - slippageTolerance)) / slippageToleranceDelimiter
+            || tokenRatio > (scaleValue3 * (slippageToleranceDelimiter + slippageTolerance)) / slippageToleranceDelimiter then
+            throw("Incorrect assets amount: amounts must have the contract ratio")
+        else if shareTokenToPayAmount == 0 then
+            throw("Too small amount to replenish")
+        else if (assetIdA == USDN && newBalanceA <= stakedAmountUSDN) || (assetIdB == USDN && newBalanceB <= stakedAmountUSDN) then
+            throwInsufficientAvailableBalance(amountWithFee, availableBalanceA, assetNameA)
+        else
+            [
+                IntegerEntry(keyBalanceA, newBalanceA),
+                IntegerEntry(keyBalanceB, newBalanceB),
+                IntegerEntry(keyShareAssetSupply, shareAssetSupply + shareTokenToPayAmount),
+                Reissue(shareAssetId, shareTokenToPayAmount, true),
+                ScriptTransfer(i.caller, shareTokenToPayAmount, shareAssetId)
+            ]
+    } else {
+        throw("Please contact support in Telegram: https://t.me/swopfisupport")
+    }
+}
+
+@Callable(i)
+func replenishWithTwoTokens(slippageTolerance: Int) = {
+    let pmtAssetIdA = i.payments[0].assetId
+    let pmtAssetIdB = i.payments[1].assetId
     # block for accounting the cost of commissions for staking operations
     let pmtAmountA = deductStakingFee(i.payments[0].amount, pmtAssetIdA)
     let pmtAmountB = deductStakingFee(i.payments[1].amount, pmtAssetIdB)
